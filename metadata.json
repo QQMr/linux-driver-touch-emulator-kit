@@ -1,0 +1,5 @@
+{
+  "name": "Copy of Live Matrix Canvas 1",
+  "description": "A high-performance React application that visualizes a real-time updating 2D data array on an HTML5 Canvas, styled as a dynamic heatmap table.",
+  "requestFramePermissions": []
+}

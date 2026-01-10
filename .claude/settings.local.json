@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "Bash(find:*)",
+      "Bash(npm install)",
+      "Bash(npm install:*)",
+      "Bash(node node_modules/vite/bin/vite.js:*)",
+      "Bash(curl:*)",
+      "Bash(node node_modules/typescript/bin/tsc:*)",
+      "Bash(git init:*)",
+      "Bash(git config:*)",
+      "Bash(cmd.exe /c \"git init\")",
+      "Bash(cmd.exe /c \"git status\")",
+      "Bash(cmd.exe /c \"git diff --staged\")",
+      "Bash(cmd.exe /c \"git add . && git commit -m \"\"Initial commit: Live Matrix Canvas visualization app\n\n- React 19 + Vite + TypeScript setup\n- Real-time 2D matrix heatmap with D3 color scales\n- Touch point tracking with trail visualization\n- Three data modes: simulation, URL fetch, playback\n- Recording and export functionality \\(CSV/JSON\\)\n- Dark/light theme support\n- Added CLAUDE.md for AI assistant guidance\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\"\"\")"
+    ]
+  }
+}
