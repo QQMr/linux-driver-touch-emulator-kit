@@ -13,3 +13,26 @@ export interface TouchPoint {
 }
 
 export type TrailStyle = 'solid' | 'dashed' | 'dotted' | 'fade';
+
+export type DataSourceMode = 'simulation' | 'url' | 'playback';
+
+export interface Frame {
+  ts: number;
+  message: string;
+  matrix: Matrix;
+  touchPoints: TouchPoint[];
+}
+
+export interface TrailsHistory {
+  [id: string | number]: { x: number; y: number }[];
+}
+
+export interface VisualSettings {
+  touchPointSize: number;
+  touchPointCount: number;
+  showTrails: boolean;
+  trailStyle: TrailStyle;
+  showMatrix: boolean;
+  showTouchPoints: boolean;
+  isDarkMode: boolean;
+}
