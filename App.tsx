@@ -95,16 +95,57 @@ export default function App() {
     }
   }, []); // No dependencies - uses refs
 
-  // Interval Effect for Data Loop
+  // SSE callback for URL mode - handles data updates from server
+  useEffect(() => {
+    if (dataSource.mode === 'url' && dataSource.useSSE) {
+      dataSource.setOnData((result) => {
+        const tp = touchPointsRef.current;
+        const rec = recordingRef.current;
+
+        if (result.touchPoints && result.touchPoints.length > 0) {
+          tp.updateTouchPoints(result.touchPoints);
+        }
+
+        if (result.debugData) {
+          setDebugData(result.debugData);
+        }
+
+        // Recording
+        if (result.matrix) {
+          rec.recordFrame(result.matrix, result.touchPoints, result.message);
+        }
+
+        setLastUpdateTime(Date.now());
+
+        // Calculate FPS
+        const now = Date.now();
+        framesRef.current++;
+        if (now - lastFpsTimeRef.current >= 1000) {
+          setFps(framesRef.current);
+          framesRef.current = 0;
+          lastFpsTimeRef.current = now;
+        }
+      });
+    } else {
+      dataSource.setOnData(null);
+    }
+  }, [dataSource.mode, dataSource.useSSE]);
+
+  // Interval Effect for Data Loop (skip for URL mode with SSE)
   useEffect(() => {
     let intervalId: ReturnType<typeof setInterval> | null = null;
+
+    // Skip interval for URL mode when SSE is enabled
+    if (dataSource.mode === 'url' && dataSource.useSSE) {
+      return;
+    }
 
     if (dataSource.isPlaying) {
       framesRef.current = 0;
       lastFpsTimeRef.current = Date.now();
 
       let interval = UPDATE_INTERVAL_MS;
-      if (dataSource.mode === 'url') interval = 500;
+      if (dataSource.mode === 'url') interval = 50; // Fallback polling
       if (dataSource.mode === 'playback') interval = 32;
 
       intervalId = setInterval(handleUpdate, interval);
@@ -115,7 +156,7 @@ export default function App() {
     return () => {
       if (intervalId) clearInterval(intervalId);
     };
-  }, [dataSource.isPlaying, handleUpdate, dataSource.mode]);
+  }, [dataSource.isPlaying, handleUpdate, dataSource.mode, dataSource.useSSE]);
 
   // Effect to render current frame immediately when scrubbing while paused
   useEffect(() => {

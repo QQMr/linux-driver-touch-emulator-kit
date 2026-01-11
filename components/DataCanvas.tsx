@@ -318,11 +318,10 @@ export const DataCanvas: React.FC<DataCanvasProps> = ({
         // Draw Points
         pointsToDraw.forEach(p => {
            const tx = headerSize + p.x * gridWidth;
-           const ty = headerSize + p.y * gridHeight;
-           const baseRadius = Math.min(cellWidth, cellHeight); 
-           const radius = baseRadius * pointSize;
-           const color = p.color || 'rgba(255, 255, 255, 0.4)';
-
+                      const ty = headerSize + p.y * gridHeight;
+                      const baseRadius = Math.min(cellWidth, cellHeight);
+                      const radius = Math.max(0, baseRadius * pointSize);
+                      const color = p.color || 'rgba(255, 255, 255, 0.4)';
            // Point Glow
            ctx.shadowBlur = 15;
            ctx.shadowColor = color;

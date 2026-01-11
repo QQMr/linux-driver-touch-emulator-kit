@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { DataSourceMode, Matrix, TouchPoint, Frame } from '../types';
 import { generateRandomMatrix, updateMatrix, getSimulatedPoints } from '../utils/dataUtils';
 import { GRID_ROWS, GRID_COLS, UPDATE_INTERVAL_MS } from '../constants';
@@ -9,6 +9,9 @@ interface UpdateResult {
   message: string;
   debugData: any;
 }
+
+// Callback type for SSE data
+type OnDataCallback = (result: UpdateResult) => void;
 
 interface UseDataSourceReturn {
   mode: DataSourceMode;
@@ -28,6 +31,10 @@ interface UseDataSourceReturn {
   isPlayingRef: React.MutableRefObject<boolean>;
   setIsPlaying: (playing: boolean) => void;
   isPlaying: boolean;
+  // SSE support
+  useSSE: boolean;
+  setUseSSE: (use: boolean) => void;
+  setOnData: (callback: OnDataCallback | null) => void;
 }
 
 export function useDataSource(): UseDataSourceReturn {
@@ -38,6 +45,7 @@ export function useDataSource(): UseDataSourceReturn {
   const [playbackData, setPlaybackData] = useState<Frame[]>([]);
   const [playbackIndex, setPlaybackIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(true);
+  const [useSSE, setUseSSE] = useState(true); // SSE enabled by default for URL mode
 
   const dataRef = useRef<Matrix>(data);
   const simulationTimeRef = useRef<number>(Date.now());
@@ -45,12 +53,100 @@ export function useDataSource(): UseDataSourceReturn {
   const isFetchingRef = useRef(false);
   const isPlayingRef = useRef(isPlaying);
   const touchPointCountRef = useRef(3);
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const onDataCallbackRef = useRef<OnDataCallback | null>(null);
 
   // Sync refs
   const updateIsPlaying = useCallback((playing: boolean) => {
     isPlayingRef.current = playing;
     setIsPlaying(playing);
   }, []);
+
+  // Set callback for SSE data
+  const setOnData = useCallback((callback: OnDataCallback | null) => {
+    onDataCallbackRef.current = callback;
+  }, []);
+
+  // SSE connection management
+  useEffect(() => {
+    // Only use SSE for URL mode when SSE is enabled and playing
+    if (mode !== 'url' || !useSSE || !isPlaying) {
+      // Close existing connection
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+      return;
+    }
+
+    // Convert /data endpoint to /stream for SSE
+    const sseUrl = url.replace(/\/data\/?$/, '/stream');
+
+    console.log('Connecting to SSE:', sseUrl);
+    setFetchError(null);
+
+    const eventSource = new EventSource(sseUrl);
+    eventSourceRef.current = eventSource;
+
+    eventSource.onopen = () => {
+      console.log('SSE connected');
+      setFetchError(null);
+    };
+
+    eventSource.onmessage = (event) => {
+      try {
+        const json = JSON.parse(event.data);
+
+        let newData: Matrix | null = null;
+        let nextTouchPoints: TouchPoint[] = [];
+        let currentMessage = '';
+
+        if (json.matrix && Array.isArray(json.matrix)) {
+          newData = json.matrix;
+          nextTouchPoints = json.touchPoints && Array.isArray(json.touchPoints)
+            ? json.touchPoints
+            : [];
+        } else if (Array.isArray(json) && Array.isArray(json[0])) {
+          newData = json;
+          nextTouchPoints = [];
+        }
+
+        currentMessage = json.message && typeof json.message === 'string'
+          ? json.message
+          : `SSE from ${sseUrl}`;
+
+        if (newData) {
+          dataRef.current = newData;
+          setData(newData);
+          setFetchError(null);
+
+          // Call the callback with the new data
+          if (onDataCallbackRef.current) {
+            onDataCallbackRef.current({
+              matrix: newData,
+              touchPoints: nextTouchPoints,
+              message: currentMessage,
+              debugData: json
+            });
+          }
+        }
+      } catch (err) {
+        console.error('SSE parse error:', err);
+      }
+    };
+
+    eventSource.onerror = (err) => {
+      console.error('SSE error:', err);
+      setFetchError('SSE connection failed. Server may not support streaming.');
+      eventSource.close();
+      eventSourceRef.current = null;
+    };
+
+    return () => {
+      eventSource.close();
+      eventSourceRef.current = null;
+    };
+  }, [mode, url, useSSE, isPlaying]);
 
   const handleUpdate = useCallback(async (): Promise<UpdateResult> => {
     let newData: Matrix | null = null;
@@ -104,7 +200,17 @@ export function useDataSource(): UseDataSourceReturn {
         }
       }
     } else {
-      // URL Mode
+      // URL Mode - only use polling if SSE is disabled
+      if (useSSE) {
+        // SSE handles updates, return current data
+        return {
+          matrix: dataRef.current,
+          touchPoints: [],
+          message: 'Using SSE stream',
+          debugData: null
+        };
+      }
+
       if (isFetchingRef.current) {
         return { matrix: null, touchPoints: [], message: '', debugData: null };
       }
@@ -153,7 +259,7 @@ export function useDataSource(): UseDataSourceReturn {
       message: currentMessage,
       debugData: currentDebugData
     };
-  }, [mode, url, playbackData]);
+  }, [mode, url, playbackData, useSSE]);
 
   const handleReset = useCallback((touchPointCount: number): { matrix: Matrix; touchPoints: TouchPoint[] } => {
     touchPointCountRef.current = touchPointCount;
@@ -211,11 +317,6 @@ export function useDataSource(): UseDataSourceReturn {
     });
   }, [updateIsPlaying]);
 
-  // Update touchPointCount ref when needed
-  const updateTouchPointCount = (count: number) => {
-    touchPointCountRef.current = count;
-  };
-
   return {
     mode,
     setMode,
@@ -236,6 +337,9 @@ export function useDataSource(): UseDataSourceReturn {
     simulationTimeRef,
     isPlayingRef,
     setIsPlaying: updateIsPlaying,
-    isPlaying
+    isPlaying,
+    useSSE,
+    setUseSSE,
+    setOnData
   };
 }
