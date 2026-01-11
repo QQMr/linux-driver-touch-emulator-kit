@@ -55,6 +55,9 @@ struct sitronix_dev {
     int data_ready;
     unsigned long sequence;
 
+    /* Sysfs control */
+    int enable_touch;  /* 0 = disabled (default), 1 = enabled */
+
     /* Simulation state */
     int sim_x;
     int sim_y;
@@ -64,12 +67,36 @@ struct sitronix_dev {
 
 static struct sitronix_dev *s_dev = NULL;
 
+/* Sysfs: enable_touch show */
+static ssize_t enable_touch_show(struct device *dev,
+                                  struct device_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%d\n", s_dev->enable_touch);
+}
+
+/* Sysfs: enable_touch store */
+static ssize_t enable_touch_store(struct device *dev,
+                                   struct device_attribute *attr,
+                                   const char *buf, size_t count)
+{
+    int val;
+    if (kstrtoint(buf, 10, &val) < 0)
+        return -EINVAL;
+
+    s_dev->enable_touch = (val != 0) ? 1 : 0;
+    printk(KERN_INFO "SitronixVirtual: enable_touch = %d\n", s_dev->enable_touch);
+    return count;
+}
+
+/* Sysfs attribute definition */
+static DEVICE_ATTR_RW(enable_touch);
+
 /* Helper to write a touch point to buffer */
 static void write_touch_point(uint8_t *buf, int id, int x, int y, int area, int intensity) {
     if (x < 0) x = 0; if (x > 16383) x = 16383;
     if (y < 0) y = 0; if (y > 16383) y = 16383;
-    
-    /* 
+
+    /*
      * Byte 0: X High [Valid(1)|Rsvd(1)|X(13:8)]
      * Byte 1: X Low  [X(7:0)]
      * Byte 2: Y High [Rsvd(2)|Y(13:8)]
@@ -113,7 +140,7 @@ static void sitronix_timer_callback(struct timer_list *t) {
                       1, dev->sim_x, dev->sim_y, 60, 100);
 
     /* 5. Report touch events via input subsystem (Protocol B) - 10 points */
-    if (dev->input) {
+    if (dev->input && dev->enable_touch) {
         int i;
         int touch_count = 0;
         uint8_t *touch_data = &dev->frame_buffer[SITRONIX_HEADER_SIZE];
@@ -275,7 +302,14 @@ static int __init sitronix_init(void) {
         ret = PTR_ERR(s_dev->device);
         goto err_device;
     }
-    
+
+    /* Create Sysfs attribute: enable_touch */
+    ret = device_create_file(s_dev->device, &dev_attr_enable_touch);
+    if (ret) {
+        printk(KERN_ALERT "SitronixVirtual: Failed to create sysfs enable_touch\n");
+        goto err_sysfs;
+    }
+
     /* Init Cdev */
     cdev_init(&s_dev->cdev, &fops);
     s_dev->cdev.owner = THIS_MODULE;
@@ -345,6 +379,8 @@ err_input_mt:
 err_input_alloc:
     cdev_del(&s_dev->cdev);
 err_cdev:
+    device_remove_file(s_dev->device, &dev_attr_enable_touch);
+err_sysfs:
     device_destroy(s_dev->class, s_dev->dev_num);
 err_device:
     class_destroy(s_dev->class);
@@ -364,6 +400,7 @@ static void __exit sitronix_exit(void) {
             /* Note: input_unregister_device() frees the device */
         }
         cdev_del(&s_dev->cdev);
+        device_remove_file(s_dev->device, &dev_attr_enable_touch);
         device_destroy(s_dev->class, s_dev->dev_num);
         class_destroy(s_dev->class);
         unregister_chrdev_region(s_dev->dev_num, 1);
