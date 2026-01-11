@@ -40,10 +40,15 @@
 #define DEFAULT_FPS 60
 #define MAX_TOUCH_POINTS 10
 
-/* Driver binary format sizes */
-#define TOUCH_DATA_SIZE 40      /* 10 x (uint16 x, uint16 y) = 40 bytes */
-#define MATRIX_DATA_SIZE 792    /* 22 x 36 x uint8 = 792 bytes */
-#define DRIVER_FRAME_SIZE 832   /* Total: 40 + 792 = 832 bytes */
+/* Sitronix Touch IC binary format sizes */
+#define SITRONIX_HEADER_SIZE 4          /* 0x0010-0x0013: AdvTouchInfo, Reserved, Gestures, Keys */
+#define SITRONIX_TOUCH_POINT_SIZE 7     /* Per touch: XH, XL, YH, YL, Area, Intensity, Reserved */
+#define SITRONIX_TOUCH_DATA_SIZE 70     /* 10 touch points x 7 bytes = 70 bytes */
+#define MATRIX_DATA_SIZE 792            /* 22 x 36 x uint8 = 792 bytes */
+#define DRIVER_FRAME_SIZE 866           /* Total: 4 + 70 + 792 = 866 bytes */
+
+/* Sitronix touch point coordinate limits (14-bit values: 6 high + 8 low) */
+#define SITRONIX_COORD_MAX 16383        /* 2^14 - 1 */
 
 /* Data source mode */
 typedef enum {
@@ -64,6 +69,8 @@ typedef struct {
     double x;       /* Normalized 0.0-1.0 */
     double y;       /* Normalized 0.0-1.0 */
     int active;
+    uint8_t area;       /* Touch area from Sitronix */
+    uint8_t intensity;  /* Touch intensity from Sitronix */
 } TouchPoint;
 
 /* Frame data (shared buffer) */
@@ -73,6 +80,10 @@ typedef struct {
     int touch_count;
     int frame_number;
     struct timespec timestamp;
+    /* Sitronix header info */
+    uint8_t adv_touch_info;     /* 0x0010: RstChip, ProxStatus, WithCoord, WithProxRaw */
+    uint8_t gesture_info;       /* 0x0012: Gesture code */
+    uint8_t keys;               /* 0x0013: Key0-Key5 status */
 } FrameData;
 
 /* Shared state between threads */
@@ -94,6 +105,9 @@ typedef struct {
 
 /* Global pointer for signal handler */
 static SharedState *g_state = NULL;
+
+/* Forward declaration for Sitronix parser (defined later) */
+int parse_sitronix_buffer(const uint8_t *buffer, FrameData *frame);
 
 /* Touch point colors */
 static const char *touch_colors[] = {
@@ -121,9 +135,15 @@ void print_usage(const char *prog_name) {
     printf("\nExamples:\n");
     printf("  %s --simulation --fps 30\n", prog_name);
     printf("  %s --driver /dev/touchmatrix --fps 60\n", prog_name);
-    printf("\nDriver binary format (832 bytes per frame):\n");
-    printf("  - Touch data: 10 x (uint16 x, uint16 y) = 40 bytes\n");
-    printf("  - Matrix data: 22 x 36 x uint8 = 792 bytes\n");
+    printf("\nSitronix driver binary format (%d bytes per frame):\n", DRIVER_FRAME_SIZE);
+    printf("  Header (4 bytes):\n");
+    printf("    0x0010: Advanced Touch Info [RstChip|ProxStatus|WithCoord|WithProxRaw|Rsvd|Rsvd]\n");
+    printf("    0x0011: Reserved\n");
+    printf("    0x0012: Gesture Info\n");
+    printf("    0x0013: Keys [Rsvd|Key5|Key4|Key3|Key2|Key1|Key0]\n");
+    printf("  Touch data (70 bytes = 10 points x 7 bytes):\n");
+    printf("    Each point: XH[Valid|Rsvd|X(13:8)], XL[X(7:0)], YH[Rsvd|Y(13:8)], YL[Y(7:0)], Area, Intensity, Rsvd\n");
+    printf("  Matrix data: 22 x 36 x uint8 = 792 bytes\n");
 }
 
 /* Parse command-line arguments */
@@ -207,16 +227,50 @@ void generate_simulation_frame(SharedState *state, FrameData *frame) {
     frame->touch_points[0].x = state->sim_touch_x[0];
     frame->touch_points[0].y = 0.3;
     frame->touch_points[0].active = 1;
+    frame->touch_points[0].area = 50;
+    frame->touch_points[0].intensity = 80;
 
     frame->touch_points[1].id = 2;
     frame->touch_points[1].x = state->sim_touch_x[1];
     frame->touch_points[1].y = 0.7;
     frame->touch_points[1].active = 1;
+    frame->touch_points[1].area = 45;
+    frame->touch_points[1].intensity = 75;
+
+    /* Initialize Sitronix header fields for simulation */
+    frame->adv_touch_info = 0x00;
+    frame->gesture_info = 0x00;
+    frame->keys = 0x00;
 
     clock_gettime(CLOCK_MONOTONIC, &frame->timestamp);
 }
 
-/* Read and parse one frame from driver device file */
+/*
+ * Read and parse one frame from driver device file (Sitronix Touch IC format)
+ *
+ * Sitronix Register Map (Report Page):
+ * -----------------------------------------------
+ * 0x0010: Advanced Touch Info (RO)
+ *         [RstChip | ProxStatus | WithCoord | WithProxRaw | Reserved | Reserved]
+ * 0x0011: Reserved
+ * 0x0012: Gesture Info (RO) - Gesture code
+ * 0x0013: Keys [Reserved | Key5 | Key4 | Key3 | Key2 | Key1 | Key0]
+ *
+ * 0x0014-0x001A: Touch Point 0 (7 bytes)
+ *   0x0014: X0 High [Valid0 | Reserved | X0_H(5:0)]
+ *   0x0015: X0 Low  [X0_L(7:0)]
+ *   0x0016: Y0 High [Reserved | Reserved | Y0_H(5:0)]
+ *   0x0017: Y0 Low  [Y0_L(7:0)]
+ *   0x0018: Touch Area 0
+ *   0x0019: Touch Intensity 0
+ *   0x001A: Reserved
+ *
+ * 0x001B-0x0021: Touch Point 1 (7 bytes)
+ * ... (same pattern)
+ * 0x0053-0x0059: Touch Point 9 (7 bytes)
+ *
+ * Then matrix/proximity raw data follows...
+ */
 int read_driver_frame(int fd, FrameData *frame) {
     uint8_t buffer[DRIVER_FRAME_SIZE];
 
@@ -232,35 +286,7 @@ int read_driver_frame(int fd, FrameData *frame) {
         return -1;
     }
 
-    /* Parse touch points (10 x uint16 pairs) */
-    uint16_t *touch_data = (uint16_t *)buffer;
-    frame->touch_count = 0;
-
-    for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
-        uint16_t raw_x = touch_data[i * 2];
-        uint16_t raw_y = touch_data[i * 2 + 1];
-
-        /* Check if touch point is valid (non-0xFFFF sentinel) */
-        if (raw_x != 0xFFFF && raw_y != 0xFFFF) {
-            frame->touch_points[frame->touch_count].id = i + 1;
-            frame->touch_points[frame->touch_count].x = raw_x / 65535.0;
-            frame->touch_points[frame->touch_count].y = raw_y / 65535.0;
-            frame->touch_points[frame->touch_count].active = 1;
-            frame->touch_count++;
-        }
-    }
-
-    /* Parse matrix data (22x36 uint8 values) */
-    uint8_t *matrix_data = buffer + TOUCH_DATA_SIZE;
-    for (int r = 0; r < ROWS; r++) {
-        for (int c = 0; c < COLS; c++) {
-            /* Scale from 0-255 to 0-100 */
-            frame->matrix[r][c] = (matrix_data[r * COLS + c] * 100) / 255;
-        }
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &frame->timestamp);
-    return 0;
+    return parse_sitronix_buffer(buffer, frame);
 }
 
 /* Data acquisition thread function */
@@ -555,6 +581,68 @@ void handle_request(int client_fd, SharedState *state) {
         /* Ignore */
     }
     close(client_fd);
+}
+
+/*
+ * Parse Sitronix frame data from buffer (used by read_driver_frame and test)
+ */
+int parse_sitronix_buffer(const uint8_t *buffer, FrameData *frame) {
+    /* Parse Sitronix header (4 bytes at offset 0) */
+    frame->adv_touch_info = buffer[0];  /* 0x0010: Advanced Touch Info */
+    /* buffer[1] is reserved (0x0011) */
+    frame->gesture_info = buffer[2];    /* 0x0012: Gesture Info */
+    frame->keys = buffer[3];            /* 0x0013: Keys */
+
+    /* Parse touch points (10 points x 7 bytes each, starting at offset 4) */
+    const uint8_t *touch_data = buffer + SITRONIX_HEADER_SIZE;
+    frame->touch_count = 0;
+
+    for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
+        const uint8_t *tp = touch_data + (i * SITRONIX_TOUCH_POINT_SIZE);
+
+        /* Byte 0: X High - bit 7 is Valid flag, bits 5-0 are X_H */
+        uint8_t x_high = tp[0];
+        int valid = (x_high >> 7) & 0x01;  /* Valid bit is bit 7 */
+
+        if (valid) {
+            /* Extract X coordinate (14-bit: 6 high + 8 low) */
+            uint16_t x_h = x_high & 0x3F;       /* bits 5-0 */
+            uint16_t x_l = tp[1];               /* full 8 bits */
+            uint16_t raw_x = (x_h << 8) | x_l;
+
+            /* Extract Y coordinate (14-bit: 6 high + 8 low) */
+            uint8_t y_high = tp[2];
+            uint16_t y_h = y_high & 0x3F;      /* bits 5-0 */
+            uint16_t y_l = tp[3];              /* full 8 bits */
+            uint16_t raw_y = (y_h << 8) | y_l;
+
+            /* Extract touch area and intensity */
+            uint8_t area = tp[4];
+            uint8_t intensity = tp[5];
+            /* tp[6] is reserved */
+
+            /* Store touch point with normalized coordinates */
+            frame->touch_points[frame->touch_count].id = i + 1;
+            frame->touch_points[frame->touch_count].x = (double)raw_x / SITRONIX_COORD_MAX;
+            frame->touch_points[frame->touch_count].y = (double)raw_y / SITRONIX_COORD_MAX;
+            frame->touch_points[frame->touch_count].active = 1;
+            frame->touch_points[frame->touch_count].area = area;
+            frame->touch_points[frame->touch_count].intensity = intensity;
+            frame->touch_count++;
+        }
+    }
+
+    /* Parse matrix data (22x36 uint8 values, after header + touch data) */
+    const uint8_t *matrix_data = buffer + SITRONIX_HEADER_SIZE + SITRONIX_TOUCH_DATA_SIZE;
+    for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) {
+            /* Scale from 0-255 to 0-100 */
+            frame->matrix[r][c] = (matrix_data[r * COLS + c] * 100) / 255;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &frame->timestamp);
+    return 0;
 }
 
 int main(int argc, char *argv[]) {
