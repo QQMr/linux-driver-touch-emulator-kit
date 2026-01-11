@@ -11,6 +11,8 @@
 #include <linux/sched.h>
 #include <linux/device.h>
 #include <linux/version.h> /* Handle version differences */
+#include <linux/input.h>
+#include <linux/input/mt.h>
 
 #define DRIVER_NAME "sitronix_virtual"
 #define CLASS_NAME "sitronix"
@@ -27,6 +29,11 @@
 
 #define UPDATE_INTERVAL_MS 60
 
+/* Screen Size for Input Device */
+#define SCREEN_MAX_X 720
+#define SCREEN_MAX_Y 1280
+#define SITRONIX_COORD_MAX 16383
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Gemini Assistant");
 MODULE_DESCRIPTION("Virtual Sitronix Touch Matrix Driver");
@@ -38,15 +45,16 @@ struct sitronix_dev {
     struct cdev cdev;
     struct class *class;
     struct device *device;
-    
+    struct input_dev *input;  /* Input device for touch events */
+
     struct mutex mutex;
     wait_queue_head_t read_queue;
     struct timer_list timer;
-    
+
     uint8_t frame_buffer[FRAME_SIZE];
     int data_ready;
     unsigned long sequence;
-    
+
     /* Simulation state */
     int sim_x;
     int sim_y;
@@ -101,10 +109,54 @@ static void sitronix_timer_callback(struct timer_list *t) {
     if (dev->sim_y <= 0 || dev->sim_y >= 16000) dev->sim_dir_y *= -1;
     
     /* 4. Write Touch Point 0 */
-    write_touch_point(&dev->frame_buffer[SITRONIX_HEADER_SIZE], 
+    write_touch_point(&dev->frame_buffer[SITRONIX_HEADER_SIZE],
                       1, dev->sim_x, dev->sim_y, 60, 100);
-                      
-    /* 5. Generate Matrix Data (Moving Gradient) */
+
+    /* 5. Report touch events via input subsystem (Protocol B) - 10 points */
+    if (dev->input) {
+        int i;
+        int touch_count = 0;
+        uint8_t *touch_data = &dev->frame_buffer[SITRONIX_HEADER_SIZE];
+
+        for (i = 0; i < MAX_TOUCH_POINTS; i++) {
+            uint8_t *tp = &touch_data[i * SITRONIX_TOUCH_POINT_SIZE];
+            int valid = tp[0] & 0x80;  /* Check Valid bit (bit 7) */
+
+            input_mt_slot(dev->input, i);
+
+            if (valid) {
+                /* Extract 14-bit coordinates from Sitronix format */
+                int raw_x = ((tp[0] & 0x3F) << 8) | tp[1];
+                int raw_y = ((tp[2] & 0x3F) << 8) | tp[3];
+                int area = tp[4];
+                int pressure = tp[5];
+
+                /* Scale to screen coordinates */
+                int screen_x = raw_x * SCREEN_MAX_X / SITRONIX_COORD_MAX;
+                int screen_y = raw_y * SCREEN_MAX_Y / SITRONIX_COORD_MAX;
+
+                input_mt_report_slot_state(dev->input, MT_TOOL_FINGER, true);
+                input_report_abs(dev->input, ABS_MT_POSITION_X, screen_x);
+                input_report_abs(dev->input, ABS_MT_POSITION_Y, screen_y);
+                input_report_abs(dev->input, ABS_MT_TOUCH_MAJOR, area);
+                input_report_abs(dev->input, ABS_MT_PRESSURE, pressure);
+                touch_count++;
+            } else {
+                /* Report slot as inactive (finger lifted) */
+                input_mt_report_slot_state(dev->input, MT_TOOL_FINGER, false);
+            }
+        }
+
+        /* Report BTN_TOUCH state */
+        input_report_key(dev->input, BTN_TOUCH, touch_count > 0);
+
+        /* Generate single-touch events from MT data for compatibility */
+        input_mt_report_pointer_emulation(dev->input, true);
+
+        input_sync(dev->input);
+    }
+
+    /* 6. Generate Matrix Data (Moving Gradient) */
     matrix_ptr = &dev->frame_buffer[SITRONIX_HEADER_SIZE + SITRONIX_TOUCH_DATA_SIZE];
     dev->sequence++;
     
@@ -232,14 +284,66 @@ static int __init sitronix_init(void) {
         printk(KERN_ALERT "SitronixVirtual: Failed to add cdev\n");
         goto err_cdev;
     }
-    
+
+    /* Allocate Input Device */
+    s_dev->input = input_allocate_device();
+    if (!s_dev->input) {
+        printk(KERN_ALERT "SitronixVirtual: Failed to allocate input device\n");
+        ret = -ENOMEM;
+        goto err_input_alloc;
+    }
+
+    /* Set Input Device Info */
+    s_dev->input->name = "Sitronix Virtual Touch";
+    s_dev->input->id.bustype = BUS_VIRTUAL;
+    s_dev->input->id.vendor = 0x1234;
+    s_dev->input->id.product = 0x5678;
+    s_dev->input->id.version = 0x0100;
+
+    /* Set Event Types */
+    set_bit(EV_ABS, s_dev->input->evbit);
+    set_bit(EV_KEY, s_dev->input->evbit);
+    set_bit(BTN_TOUCH, s_dev->input->keybit);
+
+    /* Set Single-Touch ABS Parameters (for compatibility) */
+    input_set_abs_params(s_dev->input, ABS_X, 0, SCREEN_MAX_X, 0, 0);
+    input_set_abs_params(s_dev->input, ABS_Y, 0, SCREEN_MAX_Y, 0, 0);
+
+    /* Set ABS Parameters for Multi-Touch (Protocol B) */
+    input_set_abs_params(s_dev->input, ABS_MT_POSITION_X, 0, SCREEN_MAX_X, 0, 0);
+    input_set_abs_params(s_dev->input, ABS_MT_POSITION_Y, 0, SCREEN_MAX_Y, 0, 0);
+    input_set_abs_params(s_dev->input, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
+    input_set_abs_params(s_dev->input, ABS_MT_PRESSURE, 0, 255, 0, 0);
+    input_set_abs_params(s_dev->input, ABS_MT_TRACKING_ID, 0, MAX_TOUCH_POINTS, 0, 0);
+
+    /* Initialize Multi-Touch Slots (Protocol B) */
+    ret = input_mt_init_slots(s_dev->input, MAX_TOUCH_POINTS,
+                              INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
+    if (ret) {
+        printk(KERN_ALERT "SitronixVirtual: Failed to init MT slots\n");
+        goto err_input_mt;
+    }
+
+    /* Register Input Device */
+    ret = input_register_device(s_dev->input);
+    if (ret) {
+        printk(KERN_ALERT "SitronixVirtual: Failed to register input device\n");
+        goto err_input_reg;
+    }
+
     /* Init Timer */
     timer_setup(&s_dev->timer, sitronix_timer_callback, 0);
     mod_timer(&s_dev->timer, jiffies + msecs_to_jiffies(UPDATE_INTERVAL_MS));
-    
-    printk(KERN_INFO "SitronixVirtual: Initialized. Device: /dev/%s\n", DRIVER_NAME);
+
+    printk(KERN_INFO "SitronixVirtual: Initialized. Device: /dev/%s, Input: %s\n",
+           DRIVER_NAME, s_dev->input->name);
     return 0;
 
+err_input_reg:
+err_input_mt:
+    input_free_device(s_dev->input);
+err_input_alloc:
+    cdev_del(&s_dev->cdev);
 err_cdev:
     device_destroy(s_dev->class, s_dev->dev_num);
 err_device:
@@ -255,6 +359,10 @@ err_alloc:
 static void __exit sitronix_exit(void) {
     if (s_dev) {
         del_timer_sync(&s_dev->timer);
+        if (s_dev->input) {
+            input_unregister_device(s_dev->input);
+            /* Note: input_unregister_device() frees the device */
+        }
         cdev_del(&s_dev->cdev);
         device_destroy(s_dev->class, s_dev->dev_num);
         class_destroy(s_dev->class);
