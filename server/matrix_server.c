@@ -1,15 +1,19 @@
 /*
  * Matrix Server for Live Matrix Canvas
  *
- * A simple HTTP server with SSE streaming that sends JSON frame data with:
- * - 22x36 matrix of simulated values (0-100)
- * - 2 touch points moving from left to right
+ * A threaded HTTP server with SSE streaming that sends JSON frame data with:
+ * - 22x36 matrix of values (0-100)
+ * - Up to 10 touch points
  * - Server-controlled FPS via SSE (Server-Sent Events)
  *
- * Build: gcc -o matrix_server matrix_server.c -lm
- * Run:   ./matrix_server [fps]
- *        ./matrix_server 30    # Run at 30 FPS
- *        ./matrix_server 60    # Run at 60 FPS
+ * Data acquisition runs in a separate thread, supporting:
+ * - Simulation mode: Procedural wave patterns
+ * - Driver mode: Read binary data from Linux device file
+ *
+ * Build: make (or: gcc -o matrix_server matrix_server.c -lm -lpthread)
+ * Run:   ./matrix_server [OPTIONS]
+ *        ./matrix_server --simulation --fps 60
+ *        ./matrix_server --driver /dev/touchmatrix --fps 60
  * Test:  curl http://localhost:3000/stream
  */
 
@@ -24,6 +28,9 @@
 #include <arpa/inet.h>
 #include <signal.h>
 #include <errno.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <stdint.h>
 
 #define PORT 3000
 #define ROWS 22
@@ -31,64 +38,307 @@
 #define BUFFER_SIZE 65536
 #define MAX_REQUEST_SIZE 4096
 #define DEFAULT_FPS 60
+#define MAX_TOUCH_POINTS 10
 
-/* Global state */
-static double touch_x1 = 0.0;    /* Touch point 1 x position */
-static double touch_x2 = 0.3;    /* Touch point 2 x position */
-static int frame_count = 0;      /* Frame counter */
-static double time_offset = 0.0; /* For wave animation */
-static int target_fps = DEFAULT_FPS;
-static volatile int running = 1;
+/* Driver binary format sizes */
+#define TOUCH_DATA_SIZE 40      /* 10 x (uint16 x, uint16 y) = 40 bytes */
+#define MATRIX_DATA_SIZE 792    /* 22 x 36 x uint8 = 792 bytes */
+#define DRIVER_FRAME_SIZE 832   /* Total: 40 + 792 = 832 bytes */
+
+/* Data source mode */
+typedef enum {
+    MODE_SIMULATION,
+    MODE_DRIVER
+} DataSourceMode;
+
+/* Server configuration */
+typedef struct {
+    DataSourceMode mode;
+    char device_path[256];
+    int target_fps;
+} ServerConfig;
+
+/* Touch point data */
+typedef struct {
+    int id;
+    double x;       /* Normalized 0.0-1.0 */
+    double y;       /* Normalized 0.0-1.0 */
+    int active;
+} TouchPoint;
+
+/* Frame data (shared buffer) */
+typedef struct {
+    int matrix[ROWS][COLS];
+    TouchPoint touch_points[MAX_TOUCH_POINTS];
+    int touch_count;
+    int frame_number;
+    struct timespec timestamp;
+} FrameData;
+
+/* Shared state between threads */
+typedef struct {
+    FrameData current_frame;
+    pthread_mutex_t mutex;
+    pthread_cond_t new_frame_cond;
+    volatile int running;
+    ServerConfig config;
+
+    /* Statistics */
+    unsigned long frames_acquired;
+    unsigned long frames_dropped;
+
+    /* Simulation state */
+    double time_offset;
+    double sim_touch_x[MAX_TOUCH_POINTS];
+} SharedState;
+
+/* Global pointer for signal handler */
+static SharedState *g_state = NULL;
+
+/* Touch point colors */
+static const char *touch_colors[] = {
+    "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7",
+    "#DDA0DD", "#98D8C8", "#F7DC6F", "#BB8FCE", "#85C1E9"
+};
 
 /* Signal handler for graceful shutdown */
 void handle_signal(int sig) {
     (void)sig;
-    running = 0;
-}
-
-/* Generate simulated matrix data with wave pattern */
-void generate_matrix(int matrix[ROWS][COLS]) {
-    time_offset += 0.1;
-
-    for (int r = 0; r < ROWS; r++) {
-        for (int c = 0; c < COLS; c++) {
-            /* Create a wave pattern based on position and time */
-            double wave1 = sin((c * 0.3) + time_offset) * 25;
-            double wave2 = cos((r * 0.4) + time_offset * 0.7) * 20;
-            double wave3 = sin((c + r) * 0.2 + time_offset * 1.3) * 15;
-
-            /* Combine waves and add some randomness */
-            double value = 50 + wave1 + wave2 + wave3 + (rand() % 10 - 5);
-
-            /* Clamp to 0-100 range */
-            if (value < 0) value = 0;
-            if (value > 100) value = 100;
-
-            matrix[r][c] = (int)value;
-        }
+    if (g_state) {
+        g_state->running = 0;
+        pthread_cond_broadcast(&g_state->new_frame_cond);
     }
 }
 
-/* Update touch point positions (left to right movement) */
-void update_touch_points(void) {
-    /* Move touch points from left to right */
-    touch_x1 += 0.015;
-    touch_x2 += 0.015;
-
-    /* Wrap around when reaching right edge */
-    if (touch_x1 > 1.0) touch_x1 = 0.0;
-    if (touch_x2 > 1.0) touch_x2 = 0.0;
-
-    frame_count++;
+/* Print usage information */
+void print_usage(const char *prog_name) {
+    printf("Usage: %s [OPTIONS]\n\n", prog_name);
+    printf("Options:\n");
+    printf("  --simulation        Use simulated data (default)\n");
+    printf("  --driver <path>     Read from Linux device file\n");
+    printf("  --fps <rate>        Target FPS (1-120, default: 60)\n");
+    printf("  --help              Show this help message\n");
+    printf("\nExamples:\n");
+    printf("  %s --simulation --fps 30\n", prog_name);
+    printf("  %s --driver /dev/touchmatrix --fps 60\n", prog_name);
+    printf("\nDriver binary format (832 bytes per frame):\n");
+    printf("  - Touch data: 10 x (uint16 x, uint16 y) = 40 bytes\n");
+    printf("  - Matrix data: 22 x 36 x uint8 = 792 bytes\n");
 }
 
-/* Build JSON data string (without SSE wrapper) */
-int build_json_data(char *buffer, int buffer_size, int matrix[ROWS][COLS]) {
+/* Parse command-line arguments */
+int parse_arguments(int argc, char *argv[], ServerConfig *config) {
+    /* Set defaults */
+    config->mode = MODE_SIMULATION;
+    config->device_path[0] = '\0';
+    config->target_fps = DEFAULT_FPS;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--simulation") == 0) {
+            config->mode = MODE_SIMULATION;
+        }
+        else if (strcmp(argv[i], "--driver") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --driver requires a device path\n");
+                return -1;
+            }
+            config->mode = MODE_DRIVER;
+            strncpy(config->device_path, argv[++i], sizeof(config->device_path) - 1);
+            config->device_path[sizeof(config->device_path) - 1] = '\0';
+        }
+        else if (strcmp(argv[i], "--fps") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --fps requires a numeric value\n");
+                return -1;
+            }
+            config->target_fps = atoi(argv[++i]);
+            if (config->target_fps < 1) config->target_fps = 1;
+            if (config->target_fps > 120) config->target_fps = 120;
+        }
+        else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            exit(0);
+        }
+        else {
+            /* Legacy: bare number is FPS */
+            int fps = atoi(argv[i]);
+            if (fps > 0) {
+                config->target_fps = fps;
+                if (config->target_fps > 120) config->target_fps = 120;
+            } else {
+                fprintf(stderr, "Unknown option: %s\n", argv[i]);
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/* Generate simulated frame data */
+void generate_simulation_frame(SharedState *state, FrameData *frame) {
+    state->time_offset += 0.1;
+
+    /* Generate matrix with wave pattern */
+    for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) {
+            double wave1 = sin((c * 0.3) + state->time_offset) * 25;
+            double wave2 = cos((r * 0.4) + state->time_offset * 0.7) * 20;
+            double wave3 = sin((c + r) * 0.2 + state->time_offset * 1.3) * 15;
+
+            double value = 50 + wave1 + wave2 + wave3 + (rand() % 10 - 5);
+
+            if (value < 0) value = 0;
+            if (value > 100) value = 100;
+
+            frame->matrix[r][c] = (int)value;
+        }
+    }
+
+    /* Update simulated touch points (2 points moving left to right) */
+    frame->touch_count = 2;
+
+    state->sim_touch_x[0] += 0.015;
+    state->sim_touch_x[1] += 0.015;
+    if (state->sim_touch_x[0] > 1.0) state->sim_touch_x[0] = 0.0;
+    if (state->sim_touch_x[1] > 1.0) state->sim_touch_x[1] = 0.0;
+
+    frame->touch_points[0].id = 1;
+    frame->touch_points[0].x = state->sim_touch_x[0];
+    frame->touch_points[0].y = 0.3;
+    frame->touch_points[0].active = 1;
+
+    frame->touch_points[1].id = 2;
+    frame->touch_points[1].x = state->sim_touch_x[1];
+    frame->touch_points[1].y = 0.7;
+    frame->touch_points[1].active = 1;
+
+    clock_gettime(CLOCK_MONOTONIC, &frame->timestamp);
+}
+
+/* Read and parse one frame from driver device file */
+int read_driver_frame(int fd, FrameData *frame) {
+    uint8_t buffer[DRIVER_FRAME_SIZE];
+
+    /* Read entire frame */
+    ssize_t bytes_read = read(fd, buffer, DRIVER_FRAME_SIZE);
+    if (bytes_read != DRIVER_FRAME_SIZE) {
+        if (bytes_read < 0) {
+            perror("Driver read error");
+        } else if (bytes_read > 0) {
+            fprintf(stderr, "Incomplete frame: %zd bytes (expected %d)\n",
+                    bytes_read, DRIVER_FRAME_SIZE);
+        }
+        return -1;
+    }
+
+    /* Parse touch points (10 x uint16 pairs) */
+    uint16_t *touch_data = (uint16_t *)buffer;
+    frame->touch_count = 0;
+
+    for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
+        uint16_t raw_x = touch_data[i * 2];
+        uint16_t raw_y = touch_data[i * 2 + 1];
+
+        /* Check if touch point is valid (non-0xFFFF sentinel) */
+        if (raw_x != 0xFFFF && raw_y != 0xFFFF) {
+            frame->touch_points[frame->touch_count].id = i + 1;
+            frame->touch_points[frame->touch_count].x = raw_x / 65535.0;
+            frame->touch_points[frame->touch_count].y = raw_y / 65535.0;
+            frame->touch_points[frame->touch_count].active = 1;
+            frame->touch_count++;
+        }
+    }
+
+    /* Parse matrix data (22x36 uint8 values) */
+    uint8_t *matrix_data = buffer + TOUCH_DATA_SIZE;
+    for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) {
+            /* Scale from 0-255 to 0-100 */
+            frame->matrix[r][c] = (matrix_data[r * COLS + c] * 100) / 255;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &frame->timestamp);
+    return 0;
+}
+
+/* Data acquisition thread function */
+void *data_acquisition_thread(void *arg) {
+    SharedState *state = (SharedState *)arg;
+    FrameData local_frame;
+    int driver_fd = -1;
+    int delay_us = 1000000 / state->config.target_fps;
+
+    printf("Data acquisition thread started (mode: %s, %d FPS)\n",
+           state->config.mode == MODE_SIMULATION ? "simulation" : "driver",
+           state->config.target_fps);
+
+    /* Open driver device if in driver mode */
+    if (state->config.mode == MODE_DRIVER) {
+        driver_fd = open(state->config.device_path, O_RDONLY);
+        if (driver_fd < 0) {
+            perror("Failed to open device");
+            fprintf(stderr, "Device path: %s\n", state->config.device_path);
+            state->running = 0;
+            return NULL;
+        }
+        printf("Opened device: %s\n", state->config.device_path);
+    }
+
+    /* Use precise timing with clock_nanosleep */
+    struct timespec next_frame_time;
+    clock_gettime(CLOCK_MONOTONIC, &next_frame_time);
+
+    while (state->running) {
+        int acquire_success = 0;
+
+        /* Acquire frame data based on mode */
+        if (state->config.mode == MODE_SIMULATION) {
+            generate_simulation_frame(state, &local_frame);
+            acquire_success = 1;
+        } else {
+            acquire_success = (read_driver_frame(driver_fd, &local_frame) == 0);
+        }
+
+        if (acquire_success) {
+            /* Update shared buffer with mutex protection */
+            pthread_mutex_lock(&state->mutex);
+
+            local_frame.frame_number = state->frames_acquired++;
+            memcpy(&state->current_frame, &local_frame, sizeof(FrameData));
+
+            pthread_cond_broadcast(&state->new_frame_cond);
+            pthread_mutex_unlock(&state->mutex);
+        } else {
+            state->frames_dropped++;
+        }
+
+        /* Precise timing for target FPS */
+        next_frame_time.tv_nsec += delay_us * 1000;
+        while (next_frame_time.tv_nsec >= 1000000000) {
+            next_frame_time.tv_nsec -= 1000000000;
+            next_frame_time.tv_sec++;
+        }
+
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_frame_time, NULL);
+    }
+
+    if (driver_fd >= 0) {
+        close(driver_fd);
+    }
+
+    printf("Data acquisition thread stopped\n");
+    return NULL;
+}
+
+/* Build JSON data string from FrameData */
+int build_json_data(char *buffer, int buffer_size, const FrameData *frame,
+                    const ServerConfig *config) {
     int offset = 0;
 
-    /* Start JSON object */
-    offset += snprintf(buffer + offset, buffer_size - offset,
-        "{\"matrix\":[");
+    /* Start JSON object with matrix */
+    offset += snprintf(buffer + offset, buffer_size - offset, "{\"matrix\":[");
 
     /* Write matrix rows */
     for (int r = 0; r < ROWS; r++) {
@@ -98,7 +348,8 @@ int build_json_data(char *buffer, int buffer_size, int matrix[ROWS][COLS]) {
             if (c > 0) {
                 offset += snprintf(buffer + offset, buffer_size - offset, ",");
             }
-            offset += snprintf(buffer + offset, buffer_size - offset, "%d", matrix[r][c]);
+            offset += snprintf(buffer + offset, buffer_size - offset, "%d",
+                              frame->matrix[r][c]);
         }
 
         offset += snprintf(buffer + offset, buffer_size - offset, "]");
@@ -110,28 +361,43 @@ int build_json_data(char *buffer, int buffer_size, int matrix[ROWS][COLS]) {
     /* Close matrix array */
     offset += snprintf(buffer + offset, buffer_size - offset, "],");
 
-    /* Add touch points - 2 points moving left to right */
-    offset += snprintf(buffer + offset, buffer_size - offset,
-        "\"touchPoints\":["
-        "{\"id\":1,\"x\":%.4f,\"y\":0.3,\"color\":\"#FF6B6B\"},"
-        "{\"id\":2,\"x\":%.4f,\"y\":0.7,\"color\":\"#4ECDC4\"}"
-        "],",
-        touch_x1, touch_x2);
+    /* Add touch points */
+    offset += snprintf(buffer + offset, buffer_size - offset, "\"touchPoints\":[");
 
-    /* Add message with FPS info */
+    for (int i = 0; i < frame->touch_count; i++) {
+        if (i > 0) {
+            offset += snprintf(buffer + offset, buffer_size - offset, ",");
+        }
+
+        const char *color = touch_colors[(frame->touch_points[i].id - 1) % MAX_TOUCH_POINTS];
+
+        offset += snprintf(buffer + offset, buffer_size - offset,
+            "{\"id\":%d,\"x\":%.4f,\"y\":%.4f,\"color\":\"%s\"}",
+            frame->touch_points[i].id,
+            frame->touch_points[i].x,
+            frame->touch_points[i].y,
+            color);
+    }
+
+    offset += snprintf(buffer + offset, buffer_size - offset, "],");
+
+    /* Add message with mode and FPS info */
     offset += snprintf(buffer + offset, buffer_size - offset,
-        "\"message\":\"C Server: %d FPS | Frame: %d | Points: (%.2f, 0.3) (%.2f, 0.7)\"}",
-        target_fps, frame_count, touch_x1, touch_x2);
+        "\"message\":\"C Server [%s]: %d FPS | Frame: %d | Touch: %d pts\"}",
+        config->mode == MODE_SIMULATION ? "SIM" : "DRV",
+        config->target_fps,
+        frame->frame_number,
+        frame->touch_count);
 
     return offset;
 }
 
 /* Handle SSE streaming connection */
-void handle_sse_stream(int client_fd) {
+void handle_sse_stream(int client_fd, SharedState *state) {
     char json_buffer[BUFFER_SIZE];
     char sse_buffer[BUFFER_SIZE];
-    int matrix[ROWS][COLS];
-    int delay_us = 1000000 / target_fps; /* Microseconds between frames */
+    FrameData local_frame;
+    int last_frame_number = -1;
 
     /* Send SSE headers */
     const char *sse_headers =
@@ -147,22 +413,42 @@ void handle_sse_stream(int client_fd) {
         return;
     }
 
-    printf("SSE client connected, streaming at %d FPS...\n", target_fps);
+    printf("SSE client connected, streaming at %d FPS...\n",
+           state->config.target_fps);
 
     /* Stream frames continuously */
-    while (running) {
-        /* Generate new frame data */
-        generate_matrix(matrix);
-        update_touch_points();
+    while (state->running) {
+        /* Wait for new frame with mutex */
+        pthread_mutex_lock(&state->mutex);
 
-        /* Build JSON data */
-        int json_len = build_json_data(json_buffer, sizeof(json_buffer), matrix);
+        /* Wait until we have a new frame */
+        while (state->running &&
+               state->current_frame.frame_number == last_frame_number) {
+            /* Timeout after 1 second to check running flag */
+            struct timespec timeout;
+            clock_gettime(CLOCK_REALTIME, &timeout);
+            timeout.tv_sec += 1;
+            pthread_cond_timedwait(&state->new_frame_cond, &state->mutex, &timeout);
+        }
 
-        /* Wrap in SSE format: "data: {...}\n\n" */
+        if (!state->running) {
+            pthread_mutex_unlock(&state->mutex);
+            break;
+        }
+
+        /* Copy frame data while holding mutex */
+        memcpy(&local_frame, &state->current_frame, sizeof(FrameData));
+        last_frame_number = local_frame.frame_number;
+
+        pthread_mutex_unlock(&state->mutex);
+
+        /* Build and send JSON (outside mutex) */
+        (void)build_json_data(json_buffer, sizeof(json_buffer),
+                              &local_frame, &state->config);
+
         int sse_len = snprintf(sse_buffer, sizeof(sse_buffer),
             "data: %s\n\n", json_buffer);
 
-        /* Send to client */
         ssize_t sent = write(client_fd, sse_buffer, sse_len);
         if (sent < 0) {
             if (errno == EPIPE || errno == ECONNRESET) {
@@ -174,30 +460,29 @@ void handle_sse_stream(int client_fd) {
         }
 
         /* Log every 30 frames */
-        if (frame_count % 30 == 0) {
-            printf("Frame %d: Streaming at %d FPS, touch points at (%.2f, 0.3) (%.2f, 0.7)\n",
-                   frame_count, target_fps, touch_x1, touch_x2);
+        if (local_frame.frame_number % 30 == 0) {
+            printf("Frame %d: Streaming, %d touch points\n",
+                   local_frame.frame_number, local_frame.touch_count);
         }
-
-        /* Wait for next frame */
-        usleep(delay_us);
     }
 
     close(client_fd);
 }
 
 /* Handle single JSON request (for /data endpoint) */
-void handle_data_request(int client_fd) {
+void handle_data_request(int client_fd, SharedState *state) {
     char json_buffer[BUFFER_SIZE];
     char response_buffer[BUFFER_SIZE];
-    int matrix[ROWS][COLS];
+    FrameData local_frame;
 
-    /* Generate data */
-    generate_matrix(matrix);
-    update_touch_points();
+    /* Copy current frame with mutex protection */
+    pthread_mutex_lock(&state->mutex);
+    memcpy(&local_frame, &state->current_frame, sizeof(FrameData));
+    pthread_mutex_unlock(&state->mutex);
 
     /* Build JSON response */
-    int json_len = build_json_data(json_buffer, sizeof(json_buffer), matrix);
+    int json_len = build_json_data(json_buffer, sizeof(json_buffer),
+                                   &local_frame, &state->config);
 
     /* Build HTTP response */
     int header_len = snprintf(response_buffer, sizeof(response_buffer),
@@ -210,12 +495,14 @@ void handle_data_request(int client_fd) {
         json_len);
 
     memcpy(response_buffer + header_len, json_buffer, json_len);
-    write(client_fd, response_buffer, header_len + json_len);
+    if (write(client_fd, response_buffer, header_len + json_len) < 0) {
+        /* Connection already closed, ignore */
+    }
     close(client_fd);
 }
 
 /* Handle incoming HTTP request */
-void handle_request(int client_fd) {
+void handle_request(int client_fd, SharedState *state) {
     char request[MAX_REQUEST_SIZE];
 
     /* Read request */
@@ -235,20 +522,22 @@ void handle_request(int client_fd) {
             "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n"
             "\r\n";
-        write(client_fd, cors_response, strlen(cors_response));
+        if (write(client_fd, cors_response, strlen(cors_response)) < 0) {
+            /* Ignore */
+        }
         close(client_fd);
         return;
     }
 
     /* Check for GET /stream (SSE endpoint) */
     if (strncmp(request, "GET /stream", 11) == 0) {
-        handle_sse_stream(client_fd);
+        handle_sse_stream(client_fd, state);
         return;
     }
 
     /* Check for GET /data or GET / (single JSON response) */
     if (strncmp(request, "GET /data", 9) == 0 || strncmp(request, "GET / ", 6) == 0) {
-        handle_data_request(client_fd);
+        handle_data_request(client_fd, state);
         return;
     }
 
@@ -262,42 +551,76 @@ void handle_request(int client_fd) {
         "Endpoints:\n"
         "  GET /data   - Single JSON response\n"
         "  GET /stream - SSE streaming (server-controlled FPS)\n";
-    write(client_fd, not_found, strlen(not_found));
+    if (write(client_fd, not_found, strlen(not_found)) < 0) {
+        /* Ignore */
+    }
     close(client_fd);
 }
 
 int main(int argc, char *argv[]) {
+    SharedState state;
+    pthread_t acq_thread;
     int server_fd, client_fd;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len = sizeof(client_addr);
 
-    /* Parse FPS argument */
-    if (argc > 1) {
-        target_fps = atoi(argv[1]);
-        if (target_fps < 1) target_fps = 1;
-        if (target_fps > 120) target_fps = 120;
+    /* Initialize shared state */
+    memset(&state, 0, sizeof(state));
+    state.running = 1;
+    state.sim_touch_x[0] = 0.0;
+    state.sim_touch_x[1] = 0.3;
+
+    /* Parse command-line arguments */
+    if (parse_arguments(argc, argv, &state.config) < 0) {
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    /* Initialize mutex and condition variable */
+    if (pthread_mutex_init(&state.mutex, NULL) != 0) {
+        perror("Mutex init failed");
+        return EXIT_FAILURE;
+    }
+    if (pthread_cond_init(&state.new_frame_cond, NULL) != 0) {
+        perror("Condition variable init failed");
+        pthread_mutex_destroy(&state.mutex);
+        return EXIT_FAILURE;
     }
 
     /* Setup signal handlers */
+    g_state = &state;
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
-    signal(SIGPIPE, SIG_IGN); /* Ignore broken pipe */
+    signal(SIGPIPE, SIG_IGN);
 
     /* Seed random number generator */
     srand(time(NULL));
+
+    /* Start data acquisition thread */
+    if (pthread_create(&acq_thread, NULL, data_acquisition_thread, &state) != 0) {
+        perror("Failed to create acquisition thread");
+        pthread_mutex_destroy(&state.mutex);
+        pthread_cond_destroy(&state.new_frame_cond);
+        return EXIT_FAILURE;
+    }
 
     /* Create socket */
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket failed");
-        exit(EXIT_FAILURE);
+        state.running = 0;
+        pthread_join(acq_thread, NULL);
+        return EXIT_FAILURE;
     }
 
     /* Allow address reuse */
     int opt = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("setsockopt failed");
-        exit(EXIT_FAILURE);
+        state.running = 0;
+        pthread_join(acq_thread, NULL);
+        close(server_fd);
+        return EXIT_FAILURE;
     }
 
     /* Bind to port */
@@ -308,44 +631,61 @@ int main(int argc, char *argv[]) {
 
     if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind failed");
-        exit(EXIT_FAILURE);
+        state.running = 0;
+        pthread_join(acq_thread, NULL);
+        close(server_fd);
+        return EXIT_FAILURE;
     }
 
     /* Listen for connections */
     if (listen(server_fd, 10) < 0) {
         perror("listen failed");
-        exit(EXIT_FAILURE);
+        state.running = 0;
+        pthread_join(acq_thread, NULL);
+        close(server_fd);
+        return EXIT_FAILURE;
     }
 
+    /* Print startup banner */
     printf("==============================================\n");
     printf("  Matrix Server for Live Matrix Canvas\n");
     printf("==============================================\n");
-    printf("Server running on http://localhost:%d\n", PORT);
-    printf("\n");
-    printf("Endpoints:\n");
+    printf("Mode: %s\n", state.config.mode == MODE_SIMULATION ?
+           "Simulation" : state.config.device_path);
+    printf("Target FPS: %d\n", state.config.target_fps);
+    printf("Matrix: %d rows x %d cols\n", ROWS, COLS);
+    printf("Touch points: up to %d\n", MAX_TOUCH_POINTS);
+    printf("\nEndpoints:\n");
     printf("  http://localhost:%d/data   - Single JSON\n", PORT);
     printf("  http://localhost:%d/stream - SSE streaming\n", PORT);
-    printf("\n");
-    printf("Target FPS: %d (change with: ./matrix_server <fps>)\n", target_fps);
-    printf("Matrix: %d rows x %d cols\n", ROWS, COLS);
-    printf("Touch points: 2 (moving left to right)\n");
-    printf("\n");
-    printf("Press Ctrl+C to stop\n");
+    printf("\nPress Ctrl+C to stop\n");
     printf("==============================================\n\n");
 
     /* Accept connections */
-    while (running) {
+    while (state.running) {
         client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
-            if (running) perror("accept failed");
+            if (state.running && errno != EINTR) perror("accept failed");
             continue;
         }
 
-        /* Handle request (single-threaded for simplicity) */
-        handle_request(client_fd);
+        handle_request(client_fd, &state);
     }
 
-    printf("\nShutting down server...\n");
+    /* Cleanup */
+    printf("\nShutting down...\n");
     close(server_fd);
+
+    /* Wait for acquisition thread to finish */
+    pthread_join(acq_thread, NULL);
+
+    /* Print statistics */
+    printf("Frames acquired: %lu\n", state.frames_acquired);
+    printf("Frames dropped: %lu\n", state.frames_dropped);
+
+    pthread_mutex_destroy(&state.mutex);
+    pthread_cond_destroy(&state.new_frame_cond);
+
+    printf("Server stopped.\n");
     return 0;
 }
