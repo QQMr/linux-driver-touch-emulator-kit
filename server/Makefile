@@ -13,14 +13,15 @@ CFLAGS_DEBUG = -Wall -Wextra -g -DDEBUG
 LDFLAGS = -lm -lpthread
 
 TARGET = matrix_server
-SRC = matrix_server.c
+SRC = matrix_server.c sitronix.c
+HEADERS = matrix_common.h sitronix.h
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
+$(TARGET): $(SRC) $(HEADERS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(SRC) $(LDFLAGS)
 
-debug: $(SRC)
+debug: $(SRC) $(HEADERS)
 	$(CC) $(CFLAGS_DEBUG) -o $(TARGET) $(SRC) $(LDFLAGS)
 
 clean:
