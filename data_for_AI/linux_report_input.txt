@@ -1,0 +1,66 @@
+static void tpd_down(int x, int y, int p, int id)
+{
+	/*Neostra modify for TP Coordinate adjustment 20161220 start*/
+	// int warp;
+#if defined(CONFIG_TPD_ROTATE_90)
+	tpd_rotate_90(&x, &y);
+#elif defined(CONFIG_TPD_ROTATE_270)
+	tpd_rotate_270(&x, &y);
+#elif defined(CONFIG_TPD_ROTATE_180)
+	tpd_rotate_180(&x, &y);
+#endif
+
+	// warp = x;
+	// x = y;
+	// y = warp;
+
+	// /* x=800-x; */
+	// y = tpd_dts_data.tpd_resolution[1] - y;
+	/*Neostra modify for TP Coordinate adjustment 20161220 end*/
+#ifdef TPD_SOLVE_CHARGING_ISSUE
+	if (x != 0) {
+#else
+	{
+#endif
+#if defined(CONFIG_TOUCHSCREEN_FT5X26_WUXGA) && defined(CONFIG_ARCH_MTK_PROJECT)
+		if (strncmp(CONFIG_ARCH_MTK_PROJECT, "tb8167p5_64_bsp", 15) == 0) {
+			/* check resolution before rotate */
+			TPD_RES_X = tpd_dts_data.tpd_resolution[0];
+			TPD_RES_Y = tpd_dts_data.tpd_resolution[1];
+			tpd_rotate_90(&x, &y);
+			tpd_vertical_to_landscape(&x, &y);
+		}
+#endif
+		input_report_abs(tpd->dev, ABS_MT_TRACKING_ID, id);
+		input_report_key(tpd->dev, BTN_TOUCH, 1);
+		input_report_abs(tpd->dev, ABS_MT_TOUCH_MAJOR, 1);
+		input_report_abs(tpd->dev, ABS_MT_POSITION_X, x);
+		input_report_abs(tpd->dev, ABS_MT_POSITION_Y, y);
+		FTS_DBG("fts report coordinate %s x:%d y:%d p:%d\n", __func__, x, y, p);
+		input_mt_sync(tpd->dev);
+
+	}
+}
+
+static void tpd_up(int x, int y, int id)
+{
+#if defined(CONFIG_TPD_ROTATE_90)
+	tpd_rotate_90(&x, &y);
+#elif defined(CONFIG_TPD_ROTATE_270)
+	tpd_rotate_270(&x, &y);
+#elif defined(CONFIG_TPD_ROTATE_180)
+	tpd_rotate_180(&x, &y);
+#endif
+
+#ifdef TPD_SOLVE_CHARGING_ISSUE
+	if (x != 0) {
+#else
+	{
+#endif
+		TPD_DEBUG("%s x:%d y:%d\n", __func__, x, y);
+		input_report_key(tpd->dev, BTN_TOUCH, 0);
+		input_mt_sync(tpd->dev);
+
+
+	}
+}
