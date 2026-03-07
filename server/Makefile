@@ -3,7 +3,7 @@
 # Build:  make
 # Run:    ./matrix_server [OPTIONS]
 #         ./matrix_server --simulation --fps 60
-#         ./matrix_server --driver /dev/path --fps 60
+#         ./matrix_server --driver /dev/sitronix_virtual --fps 60
 # Clean:  make clean
 # Debug:  make debug
 
