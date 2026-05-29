@@ -25,7 +25,7 @@
 #define SITRONIX_TOUCH_POINT_SIZE 7
 #define SITRONIX_TOUCH_DATA_SIZE (MAX_TOUCH_POINTS * SITRONIX_TOUCH_POINT_SIZE)
 #define MATRIX_DATA_SIZE (ROWS * COLS)
-#define FRAME_SIZE (SITRONIX_HEADER_SIZE + SITRONIX_TOUCH_DATA_SIZE + MATRIX_DATA_SIZE) /* 866 */
+#define SITRONIX_FRAME_SIZE (SITRONIX_HEADER_SIZE + SITRONIX_TOUCH_DATA_SIZE + MATRIX_DATA_SIZE) /* 866 */
 
 #define UPDATE_INTERVAL_MS 60
 
@@ -51,7 +51,7 @@ struct sitronix_dev {
     wait_queue_head_t read_queue;
     struct timer_list timer;
 
-    uint8_t frame_buffer[FRAME_SIZE];
+    uint8_t frame_buffer[SITRONIX_FRAME_SIZE];
     int data_ready;
     unsigned long sequence;
 
@@ -113,14 +113,18 @@ static void write_touch_point(uint8_t *buf, int id, int x, int y, int area, int 
 
 /* Timer Callback - Generate Data */
 static void sitronix_timer_callback(struct timer_list *t) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+    struct sitronix_dev *dev = timer_container_of(dev, t, timer);
+#else
     struct sitronix_dev *dev = from_timer(dev, t, timer);
+#endif
     int r, c;
     uint8_t *matrix_ptr;
     
     mutex_lock(&dev->mutex);
     
     /* 1. Clear Buffer */
-    memset(dev->frame_buffer, 0, FRAME_SIZE);
+    memset(dev->frame_buffer, 0, SITRONIX_FRAME_SIZE);
     
     /* 2. Header (Advanced Touch Info) */
     dev->frame_buffer[0] = 0x00; /* Normal */
@@ -215,7 +219,7 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
     int ret;
     
     /* We only support reading full frames or nothing */
-    if (len < FRAME_SIZE) {
+    if (len < SITRONIX_FRAME_SIZE) {
         return -EINVAL;
     }
     
@@ -229,7 +233,7 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
     
     mutex_lock(&dev->mutex);
     
-    if (copy_to_user(buffer, dev->frame_buffer, FRAME_SIZE)) {
+    if (copy_to_user(buffer, dev->frame_buffer, SITRONIX_FRAME_SIZE)) {
         mutex_unlock(&dev->mutex);
         return -EFAULT;
     }
@@ -238,7 +242,7 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
     
     mutex_unlock(&dev->mutex);
     
-    return FRAME_SIZE;
+    return SITRONIX_FRAME_SIZE;
 }
 
 /* Close */
@@ -385,7 +389,11 @@ err_alloc:
 /* Module Exit */
 static void __exit sitronix_exit(void) {
     if (s_dev) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+        timer_delete_sync(&s_dev->timer);
+#else
         del_timer_sync(&s_dev->timer);
+#endif
         if (s_dev->input) {
             input_unregister_device(s_dev->input);
             /* Note: input_unregister_device() frees the device */
