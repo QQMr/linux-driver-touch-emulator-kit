@@ -70,9 +70,7 @@ export default function App() {
 
     const result = await ds.handleUpdate();
 
-    if (result.touchPoints && result.touchPoints.length > 0) {
-      tp.updateTouchPoints(result.touchPoints);
-    }
+    tp.updateTouchPoints(result.touchPoints || []);
 
     if (result.debugData) {
       setDebugData(result.debugData);
@@ -102,9 +100,7 @@ export default function App() {
         const tp = touchPointsRef.current;
         const rec = recordingRef.current;
 
-        if (result.touchPoints && result.touchPoints.length > 0) {
-          tp.updateTouchPoints(result.touchPoints);
-        }
+        tp.updateTouchPoints(result.touchPoints || []);
 
         if (result.debugData) {
           setDebugData(result.debugData);
