@@ -83,8 +83,19 @@ static ssize_t enable_touch_store(struct device *dev,
     if (kstrtoint(buf, 10, &val) < 0)
         return -EINVAL;
 
+    mutex_lock(&dev->mutex);
     s_dev->enable_touch = (val != 0) ? 1 : 0;
     printk(KERN_INFO "SitronixVirtual: enable_touch = %d\n", s_dev->enable_touch);
+
+    if(s_dev->enable_touch == 1)
+    {
+        s_dev->sim_x = 0;
+        s_dev->sim_y = 0;
+        s_dev->sim_dir_x = 200;
+        s_dev->sim_dir_x = 150;
+    }
+    mutex_unlock(&dev->mutex);
+
     return count;
 }
 
@@ -133,17 +144,19 @@ static void sitronix_timer_callback(struct timer_list *t) {
     dev->frame_buffer[3] = 0x00; /* No Keys */
     
     /* 3. Update Simulation State (Bouncing Ball) */
-    dev->sim_x += dev->sim_dir_x;
-    dev->sim_y += dev->sim_dir_y;
-    
-    if (dev->sim_x <= 0 || dev->sim_x >= 16000) dev->sim_dir_x *= -1;
-    if (dev->sim_y <= 0 || dev->sim_y >= 16000) dev->sim_dir_y *= -1;
-    
-    /* 4. Write Touch Point 0 */
-    write_touch_point(&dev->frame_buffer[SITRONIX_HEADER_SIZE],
-                      1, dev->sim_x, dev->sim_y, 60, 100);
-
-    /* 5. Report touch events via input subsystem (Protocol A) - 10 points */
+    if(dev->enable_touch)
+    {
+        dev->sim_x += dev->sim_dir_x;
+        dev->sim_y = 8000;
+        
+        /* 4. Write Touch Point 0 */
+        if(dev->sim_x < 15000)
+        {
+            write_touch_point(&dev->frame_buffer[SITRONIX_HEADER_SIZE],
+                        1, dev->sim_x, dev->sim_y, 60, 100);
+        }
+    }
+    /* 5. Report touch events via input subsystem (Protocol B) */
     if (dev->input && dev->enable_touch) {
         int i;
         int touch_count = 0;
@@ -151,37 +164,33 @@ static void sitronix_timer_callback(struct timer_list *t) {
 
         for (i = 0; i < MAX_TOUCH_POINTS; i++) {
             uint8_t *tp = &touch_data[i * SITRONIX_TOUCH_POINT_SIZE];
-            int valid = tp[0] & 0x80;  /* Check Valid bit (bit 7) */
+            int valid = tp[0] & 0x80;
+
+            input_mt_slot(dev->input, i);
 
             if (valid) {
-                /* Extract 14-bit coordinates from Sitronix format */
                 int raw_x = ((tp[0] & 0x3F) << 8) | tp[1];
                 int raw_y = ((tp[2] & 0x3F) << 8) | tp[3];
                 int area = tp[4];
                 int pressure = tp[5];
-
-                /* Scale to screen coordinates */
                 int screen_x = raw_x * SCREEN_MAX_X / SITRONIX_COORD_MAX;
                 int screen_y = raw_y * SCREEN_MAX_Y / SITRONIX_COORD_MAX;
 
-                /* Report touch down - Protocol A (like reference tpd_down) */
-                input_report_abs(dev->input, ABS_MT_TRACKING_ID, i);
-                input_report_key(dev->input, BTN_TOUCH, 1);
+                input_mt_report_slot_state(dev->input, MT_TOOL_FINGER, true);
                 input_report_abs(dev->input, ABS_MT_TOUCH_MAJOR, area);
                 input_report_abs(dev->input, ABS_MT_PRESSURE, pressure);
                 input_report_abs(dev->input, ABS_MT_POSITION_X, screen_x);
                 input_report_abs(dev->input, ABS_MT_POSITION_Y, screen_y);
-                input_mt_sync(dev->input);  /* Protocol A: sync after each point */
                 touch_count++;
+            } else {
+                input_mt_report_slot_state(dev->input, MT_TOOL_FINGER, false);
             }
         }
 
-        /* If no touches, report touch up - Protocol A (like reference tpd_up) */
-        if (touch_count == 0) {
-            input_report_key(dev->input, BTN_TOUCH, 0);
-            input_mt_sync(dev->input);
-        }
+        if (touch_count == 0)
+            dev->enable_touch = 0;
 
+        input_mt_report_pointer_emulation(dev->input, true);
         input_sync(dev->input);
     }
 
@@ -345,14 +354,18 @@ static int __init sitronix_init(void) {
     input_set_abs_params(s_dev->input, ABS_X, 0, SCREEN_MAX_X, 0, 0);
     input_set_abs_params(s_dev->input, ABS_Y, 0, SCREEN_MAX_Y, 0, 0);
 
-    /* Set ABS Parameters for Multi-Touch (Protocol A) */
+    /* Set ABS Parameters for Multi-Touch (Protocol B) */
     input_set_abs_params(s_dev->input, ABS_MT_POSITION_X, 0, SCREEN_MAX_X, 0, 0);
     input_set_abs_params(s_dev->input, ABS_MT_POSITION_Y, 0, SCREEN_MAX_Y, 0, 0);
     input_set_abs_params(s_dev->input, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
     input_set_abs_params(s_dev->input, ABS_MT_PRESSURE, 0, 255, 0, 0);
-    input_set_abs_params(s_dev->input, ABS_MT_TRACKING_ID, 0, MAX_TOUCH_POINTS, 0, 0);
 
-    /* Protocol A: No input_mt_init_slots() needed */
+    /* Protocol B: allocate slots; ABS_MT_TRACKING_ID range set automatically */
+    ret = input_mt_init_slots(s_dev->input, MAX_TOUCH_POINTS, INPUT_MT_DIRECT);
+    if (ret) {
+        printk(KERN_ALERT "SitronixVirtual: Failed to init MT slots\n");
+        goto err_input_alloc;
+    }
 
     /* Register Input Device */
     ret = input_register_device(s_dev->input);
